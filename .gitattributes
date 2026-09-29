@@ -1,0 +1,4 @@
+# These run on a Linux broker host and under Git Bash on Windows. A CRLF shebang
+# makes them unrunnable ("bad interpreter: /bin/bash^M"), and this repo is developed
+# on Windows with core.autocrlf=true, so pin them to LF explicitly.
+*.sh text eol=lf
