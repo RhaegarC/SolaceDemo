@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="SolaceClient/SolaceClient.csproj" Id="c70164f0-5fa0-45ed-8f01-47cae4a184c5" />
+  <Project Path="SolaceConsumer/SolaceConsumer.csproj" Id="b718b27b-3e72-491c-aee7-10c7af60fdf4" />
+</Solution>

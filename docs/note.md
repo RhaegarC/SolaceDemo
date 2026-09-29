@@ -1,0 +1,2 @@
+## Docker Run
+- docker run -d -p 8080:8080 -p 55555:55555 --shm-size=1g -v E:/backup/dockerdata/solace:/var/lib/solace --env username_admin_globalaccesslevel=admin --env username_admin_password=QAZwsx.123456 --name=solace solace/solace-pubsub-standard
