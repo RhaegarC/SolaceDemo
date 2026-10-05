@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using SolaceConsumer;
 using SolaceSystems.Solclient.Messaging;
 using SolaceSystems.Solclient.Messaging.SDT;
@@ -8,6 +9,45 @@ var store = new AttachmentStore();
 
 Log($"host {options.Host}  vpn {options.VpnName}  user {options.UserName}");
 Log($"queue {options.QueueName}, subscribed to topic case/>");
+
+// Loaded before the SDK is initialised, so an unreadable or wrong-password container is a
+// printed line here rather than an opaque failure out of the native library.
+X509Certificate2? clientCertificate = null;
+if (options.UseClientCertificate)
+{
+    var certificatePath = options.ClientCertificateFile!;
+    if (!File.Exists(certificatePath))
+    {
+        Log($"client certificate not found: {certificatePath}");
+        Log("  the path is resolved against the application directory, beside appsettings.json");
+        return 1;
+    }
+
+    try
+    {
+        // Exportable is not optional: the SDK marshals the private key out of this object
+        // into the native TLS stack, and a key loaded into a non-exportable container
+        // fails with "Failed to load certificate private key bytes".
+        clientCertificate = X509CertificateLoader.LoadPkcs12FromFile(
+            certificatePath, options.ClientCertificatePassword, X509KeyStorageFlags.Exportable);
+    }
+    catch (CryptographicException ex)
+    {
+        Log($"could not load {Path.GetFileName(certificatePath)}: {ex.Message}");
+        Log("  Solace:PrivateKeyPassword must be the password of the PKCS#12 container");
+        return 1;
+    }
+
+    Log($"client certificate {Path.GetFileName(certificatePath)} → auth scheme CLIENT_CERTIFICATE");
+    Log($"  subject {clientCertificate.Subject}, expires {clientCertificate.NotAfter:yyyy-MM-dd}");
+}
+
+if (!options.ValidateServerCertificate)
+{
+    // Loud, because this is the check that the process is talking to the broker it thinks
+    // it is. With it off, anything holding a valid certificate for the hostname is accepted.
+    Log("WARNING: broker certificate validation is disabled — the broker is not authenticated");
+}
 
 // Initialise and dispose explicitly rather than with using: the SDK's cleanup has to
 // run after the session is gone, and using would reverse that order.
@@ -27,13 +67,58 @@ var sessionProperties = new SessionProperties
     ConnectTimeoutInMsecs = 10_000,
 };
 
-var session = context.CreateSession(sessionProperties, null, OnSessionEvent);
-
-var connectResult = session.Connect();
-if (connectResult != ReturnCode.SOLCLIENT_OK)
+if (clientCertificate is not null)
 {
-    Log($"connect failed: {connectResult}");
-    session.Dispose();
+    // The certificate is what proves who this client is; the password above is the
+    // basic-auth credential and is not consulted under this scheme.
+    //
+    // The certificate is handed over as an X509Certificate2 rather than as a file name.
+    // The SDK's SSLClientCertificateFile/SSLClientPrivateKeyFile properties are read by
+    // an OpenSSL-based native layer that expects PEM: pointed at a PKCS#12 container it
+    // fails with "no start line", because a PKCS#12 has no such header.
+    sessionProperties.AuthenticationScheme = AuthenticationSchemes.CLIENT_CERTIFICATE;
+    sessionProperties.SSLClientCertificate = clientCertificate;
+}
+
+if (!options.ValidateServerCertificate)
+{
+    sessionProperties.SSLValidateCertificate = false;
+}
+else if (options.TrustedCaDirectory is { } trustedCaDirectory)
+{
+    // For a broker behind a private CA, rather than installing that CA machine-wide.
+    sessionProperties.SSLTrustStoreDir = trustedCaDirectory;
+}
+
+ISession session;
+try
+{
+    session = context.CreateSession(sessionProperties, null, OnSessionEvent);
+
+    var connectResult = session.Connect();
+    if (connectResult != ReturnCode.SOLCLIENT_OK)
+    {
+        Log($"connect failed: {connectResult}");
+        session.Dispose();
+        context.Dispose();
+        ContextFactory.Instance.Cleanup();
+        return 1;
+    }
+}
+catch (OperationErrorException ex)
+{
+    // The SDK puts the useful part in ErrorInfo; ex.Message is only ever "Failed to
+    // create session" or "Failed to connect session".
+    Log($"could not establish the session: {ex.ErrorInfo}");
+
+    if (options.ValidateServerCertificate && options.TrustedCaDirectory is null)
+    {
+        // Validation on with no trust store is an error to this SDK, not a fallback to
+        // the operating system's store. Both settings are in appsettings.json.
+        Log("  validation is on but no trust store is configured — set Solace:TrustedCaDirectory");
+        Log("  to a directory of CA certificates, or Solace:ValidateServerCertificate to false");
+    }
+
     context.Dispose();
     ContextFactory.Instance.Cleanup();
     return 1;
