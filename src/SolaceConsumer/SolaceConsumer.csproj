@@ -16,6 +16,12 @@
     <None Update="appsettings.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <!-- The client certificate is read from disk when the session connects, and the
+         configured path resolves against the application directory, so the container has
+         to be there and not only in the project. -->
+    <None Update="*.pfx">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

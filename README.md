@@ -16,8 +16,8 @@ SolaceClient (WPF)                          SolaceConsumer (console)
         ▼                                              │
   topic  case/{caseId}/attachment/{format}/{slug}      │
         │                                              │
-        └────────► queue CASE.ATTACH.Q ◄───────────────┘
-                    subscribed to case/>
+        └───► test/integration/dataTran/sysname/cc/case/attach/q
+              queue, subscribed to case/  ◄────────────┘
 ```
 
 ## Project layout
@@ -106,6 +106,58 @@ Received files land under `out/{caseId}/{filename}` relative to the consumer's w
 3. **The cap.** Add a file of 11 MB. It is marked `REFUSED` in the list and nothing is published
    for it; the rest of the case publishes normally.
 
+## Client certificate authentication
+
+Both apps can authenticate with a client certificate instead of a password. The settings and the code
+path are the same on each side, so one container serves the publisher and the consumer. Put the
+PKCS#12 container beside each `appsettings.json` — that is, in `src/SolaceClient/` and in
+`src/SolaceConsumer/` — and name it:
+
+```json
+"Solace": {
+  "Host": "tcps://broker-host:55443",
+  "UserName": "costestclient",
+  "privateKeyName": "costest.pfx",
+  "PrivateKeyPassword": "<password of the .pfx>"
+}
+```
+
+`PrivateKeyPassword` falls back to `Password` when it is absent, which is convenient only when the
+two genuinely are the same value. Setting it explicitly is clearer.
+
+`UserName` has to name the identity the certificate resolves to. A broker configured with
+`authenticationClientCertUsernameSource: common-name` matches the certificate's *common name* — not
+the file name, and not whatever else was typed here. A certificate whose CN is `test-client` needs
+`UserName` to be `test-client`.
+
+`*.pfx` is gitignored, so the container is never committed — it has to be copied into each project
+by hand. The build copies it beside the executable in both, because the path is resolved against the
+application directory, not the working directory.
+
+Three things have to hold for this to connect, and each fails differently:
+
+- **The broker must be listening for TLS.** Client certificate authentication is only offered over
+  a TLS session, so the host has to be `tcps://` and the port has to be the broker's TLS port — not
+  the plaintext SMF port. Pointing `tcps://` at a plaintext port gives
+  `SSL error: 'wrong version number'`, which is the TLS client receiving a non-TLS reply.
+- **The certificate must be signed with SHA-256 or better.** The SDK's native TLS stack is OpenSSL 3,
+  which enforces a minimum security level and refuses a SHA-1 signature with
+  `SSL_use_cert_and_key: 'ca md too weak'`. A SHA-1 certificate cannot be used at all, whatever the
+  broker is configured to trust.
+- **The broker's own certificate must be trusted, or validation turned off.** Set
+  `"ValidateServerCertificate": false` for a broker behind a private CA, accepting that the broker
+  is then not authenticated. Alternatively set `"TrustedCaDirectory"` to a directory of CA
+  certificates. This SDK treats validation with *no* trust store as an error
+  (`FailedLoadingTruststore`) rather than falling back to the operating system's store, so the two
+  settings go together.
+
+The certificate is handed to the SDK as an `X509Certificate2` rather than as a file name. The SDK's
+`SSLClientCertificateFile` / `SSLClientPrivateKeyFile` properties are read by an OpenSSL-based native
+layer that expects PEM, so pointing them at a PKCS#12 container fails with `'no start line'`. It is
+also loaded with `X509KeyStorageFlags.Exportable`, because the SDK marshals the private key out to
+that native layer and a non-exportable key fails with
+`Failed to load certificate private key bytes`.
+
 ## Decisions and their costs
 
 **Raw binary, not base64.** A JSON envelope would inflate the payload ~33%, cutting the usable file
@@ -113,8 +165,11 @@ ceiling from 10 MB to about 7.5 MB. Raw bytes keep the full budget.
 
 **The cap defaults to 9,500,000 bytes, not 10,000,000.** The broker's limit applies to the whole
 message, so a file *at* 10 MB plus its properties and headers would be refused by the broker after
-passing client-side validation. `provision.sh` prints the broker's real `maxMsgSize`, and the client
-prints the limit it read from the broker at connect — compare them if you change the cap.
+passing client-side validation. The client asks the broker for its real ceiling at connect
+(`MAX_GUARANTEED_MSG_SIZE`) and shows it beside the configured cap, so the two can be compared if
+the cap is changed. That number is not in the message-VPN's SEMP config, so `provision.sh` can only
+report it where a broker exposes a `maxMsgSize` field — on the broker used here it does not, and the
+script says so rather than inventing a figure.
 
 **Guaranteed delivery, so every message is settled.** The consumer acks every message, including the
 ones it rejects. On a durable queue an unsettled message is redelivered forever, so a single

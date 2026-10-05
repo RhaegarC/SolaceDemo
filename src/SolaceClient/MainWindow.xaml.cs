@@ -39,7 +39,25 @@ public partial class MainWindow : Window
 
             var brokerLimit = _publisher.BrokerMaxGuaranteedMessageBytes;
             var brokerNote = brokerLimit > 0 ? $", broker guarantees up to {brokerLimit:N0} bytes" : string.Empty;
-            UpdateStatus($"Connected. Cap {_options.MaxAttachmentBytes:N0} bytes{brokerNote}.");
+            var identityNote = _publisher.ClientCertificateSubject is { } subject
+                ? $", client certificate {subject}"
+                : string.Empty;
+            var validationNote = _options.ValidateServerCertificate ? string.Empty : ", broker NOT authenticated";
+
+            UpdateStatus($"Connected. Cap {_options.MaxAttachmentBytes:N0} bytes{brokerNote}{identityNote}{validationNote}.");
+
+            if (_publisher.ClientCertificateSubject is { } identity)
+            {
+                Log($"client certificate {identity}");
+            }
+
+            if (!_options.ValidateServerCertificate)
+            {
+                // Loud, because this is the check that the process is talking to the
+                // broker it thinks it is. With it off, anything holding a valid
+                // certificate for the host name is accepted.
+                Log("WARNING: broker certificate validation is disabled — the broker is not authenticated");
+            }
         }
         catch (Exception ex)
         {
