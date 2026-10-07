@@ -26,12 +26,34 @@ public sealed class DemoOptions
     /// </summary>
     private const long DefaultMaxAttachmentBytes = 9_500_000L;
 
+    /// <summary>
+    /// The size a file has to exceed to be split, and the size of each piece it is split
+    /// into. One value rather than two: a chunk larger than the split point contradicts
+    /// itself, and a smaller one sends more messages than the file needs.
+    /// </summary>
+    private const int DefaultChunkSizeBytes = 5_000_000;
+
+    /// <summary>
+    /// The largest whole file the client will send. Chunking lifts the per-message ceiling
+    /// off an individual file; it does not remove the need for some ceiling, because the
+    /// file is read into memory whole at both ends.
+    /// </summary>
+    private const long DefaultMaxFileBytes = 200_000_000L;
+
     public string Host { get; init; } = DefaultHost;
     public string VpnName { get; init; } = DefaultVpnName;
     public string UserName { get; init; } = DefaultUserName;
     public string Password { get; init; } = DefaultPassword;
     public string TopicPrefix { get; init; } = DefaultTopicPrefix;
+
+    /// <summary>The ceiling on one message. Chunking keeps every chunk under it.</summary>
     public long MaxAttachmentBytes { get; init; } = DefaultMaxAttachmentBytes;
+
+    /// <summary>A file larger than this is sent as several messages of at most this many bytes.</summary>
+    public int ChunkSizeBytes { get; init; } = DefaultChunkSizeBytes;
+
+    /// <summary>The ceiling on one whole file. A file at or over it is refused, not chunked.</summary>
+    public long MaxFileBytes { get; init; } = DefaultMaxFileBytes;
 
     /// <summary>
     /// Full path to the PKCS#12 container holding the client certificate and its private
@@ -73,6 +95,15 @@ public sealed class DemoOptions
         var certificateFile = ResolvePath(
             config["Solace:ClientCertificateFile"] ?? config["Solace:PrivateKeyName"]);
 
+        var maxAttachmentBytes = ReadPositive(config["Demo:MaxAttachmentBytes"], DefaultMaxAttachmentBytes);
+
+        // A chunk larger than one message can never be sent, so the message cap wins over
+        // whatever chunk size was configured. Clamping silently beats discovering the
+        // contradiction as a broker rejection at publish time.
+        var chunkSizeBytes = (int)Math.Min(
+            ReadPositive(config["Demo:ChunkSizeBytes"], DefaultChunkSizeBytes),
+            Math.Min(maxAttachmentBytes, int.MaxValue));
+
         return new DemoOptions
         {
             Host = config["Solace:Host"] ?? DefaultHost,
@@ -80,9 +111,9 @@ public sealed class DemoOptions
             UserName = config["Solace:UserName"] ?? DefaultUserName,
             Password = config["Solace:Password"] ?? DefaultPassword,
             TopicPrefix = config["Demo:TopicPrefix"] ?? DefaultTopicPrefix,
-            MaxAttachmentBytes = long.TryParse(config["Demo:MaxAttachmentBytes"], out var cap) && cap > 0
-                ? cap
-                : DefaultMaxAttachmentBytes,
+            MaxAttachmentBytes = maxAttachmentBytes,
+            ChunkSizeBytes = chunkSizeBytes,
+            MaxFileBytes = ReadPositive(config["Demo:MaxFileBytes"], DefaultMaxFileBytes),
             ClientCertificateFile = certificateFile,
             ClientCertificatePassword = config["Solace:ClientCertificatePassword"]
                 ?? config["Solace:PrivateKeyPassword"]
@@ -99,6 +130,14 @@ public sealed class DemoOptions
     /// </summary>
     private static bool ReadBool(string? value, bool fallback) =>
         bool.TryParse(value, out var parsed) ? parsed : fallback;
+
+    /// <summary>
+    /// Parses a byte-count setting, falling back when it is absent or unparseable. Zero and
+    /// negative are treated as absent rather than honoured: a size of nothing is a typo in a
+    /// configuration file, not a request to disable the feature it configures.
+    /// </summary>
+    private static long ReadPositive(string? value, long fallback) =>
+        long.TryParse(value, out var parsed) && parsed > 0 ? parsed : fallback;
 
     /// <summary>
     /// Resolves a configured file name against the application directory, which is where
