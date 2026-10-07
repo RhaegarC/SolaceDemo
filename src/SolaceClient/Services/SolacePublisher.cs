@@ -120,7 +120,59 @@ public sealed class SolacePublisher : IDisposable
     /// everything the consumer needs to route and name the file is a user property.
     /// Throws if the broker refuses the send, so the caller can report it per file.
     /// </summary>
-    public void Publish(string topic, string caseId, string fileName, string contentType, byte[] payload)
+    public void Publish(string topic, string caseId, string fileName, string contentType, byte[] payload) =>
+        Send(topic, caseId, fileName, contentType, payload, null);
+
+    /// <summary>
+    /// Publishes one attachment, splitting it over several messages when it is larger than
+    /// <paramref name="chunkSize"/>. Every chunk repeats the topic and the naming properties
+    /// and adds the group that lets the consumer reassemble them, so the two ends agree on
+    /// the file from any single message. Returns the number of messages sent.
+    ///
+    /// A file that fits in one message is sent as one, unchanged — the common case does not
+    /// pay for the feature.
+    /// </summary>
+    public int PublishAttachment(string topic, string caseId, string fileName, string contentType, byte[] payload, int chunkSize)
+    {
+        if (chunkSize <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(chunkSize), chunkSize, "Chunk size must be positive.");
+        }
+
+        var chunkCount = (int)((payload.LongLength + chunkSize - 1) / chunkSize);
+        if (chunkCount <= 1)
+        {
+            Publish(topic, caseId, fileName, contentType, payload);
+            return 1;
+        }
+
+        // One id per file rather than per chunk: it is what ties the parts together at the
+        // far end, and it has to hold while chunks of other files are interleaved between
+        // them — which happens as soon as two cases are published at once.
+        var transferId = Guid.NewGuid().ToString("N");
+
+        // Hashed once over the whole file rather than per chunk. The per-message hash below
+        // proves each part arrived intact; this is what proves the file did.
+        var fileSha256 = Sha256Hex(payload);
+
+        for (var index = 0; index < chunkCount; index++)
+        {
+            // Long arithmetic: index * chunkSize overflows an int for a file near the
+            // 2 GB array ceiling, and a wrapped offset would silently send the wrong bytes.
+            var offset = (int)((long)index * chunkSize);
+            var length = Math.Min(chunkSize, payload.Length - offset);
+
+            var chunk = new byte[length];
+            Buffer.BlockCopy(payload, offset, chunk, 0, length);
+
+            Send(topic, caseId, fileName, contentType, chunk,
+                new ChunkDescriptor(transferId, index, chunkCount, payload.LongLength, fileSha256));
+        }
+
+        return chunkCount;
+    }
+
+    private void Send(string topic, string caseId, string fileName, string contentType, byte[] payload, ChunkDescriptor? chunk)
     {
         var session = _session ?? throw new InvalidOperationException("Not connected.");
 
@@ -137,7 +189,19 @@ public sealed class SolacePublisher : IDisposable
         properties.AddString(MessageProperties.FileName, fileName);
         properties.AddString(MessageProperties.ContentType, contentType);
         properties.AddInt64(MessageProperties.Size, payload.LongLength);
-        properties.AddString(MessageProperties.Sha256, Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(payload)).ToLowerInvariant());
+        properties.AddString(MessageProperties.Sha256, Sha256Hex(payload));
+
+        // size and sha256 above describe this message, not the file, so they stay correct
+        // for a chunk without special-casing. The chunk group is what adds the file's own.
+        if (chunk is { } descriptor)
+        {
+            properties.AddString(MessageProperties.TransferId, descriptor.TransferId);
+            properties.AddInt32(MessageProperties.ChunkIndex, descriptor.Index);
+            properties.AddInt32(MessageProperties.ChunkCount, descriptor.Count);
+            properties.AddInt64(MessageProperties.FileSize, descriptor.FileSize);
+            properties.AddString(MessageProperties.FileSha256, descriptor.FileSha256);
+        }
+
         properties.Close();
 
         var result = session.Send(message);
@@ -146,6 +210,12 @@ public sealed class SolacePublisher : IDisposable
             throw new InvalidOperationException($"Publish to {topic} failed: {result}");
         }
     }
+
+    private static string Sha256Hex(byte[] payload) =>
+        Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
+
+    /// <summary>What a chunk needs to say about the file it is part of.</summary>
+    private readonly record struct ChunkDescriptor(string TransferId, int Index, int Count, long FileSize, string FileSha256);
 
     /// <summary>
     /// Loads the PKCS#12 container named in settings. Connect runs on a background thread

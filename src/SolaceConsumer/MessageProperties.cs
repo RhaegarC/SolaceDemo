@@ -5,7 +5,7 @@ namespace SolaceConsumer;
 ///
 /// SolaceClient declares the same names in its own copy of this file. There is no shared
 /// assembly by design, so if the publisher renames one of these the messages stop
-/// carrying it — and <c>Require</c> in Program.cs rejects on the missing name, which is
+/// carrying it — and <see cref="RequiredProperties"/> rejects on the missing name, which is
 /// what turns that drift into a visible rejection instead of a silent wrong write.
 /// </summary>
 public static class MessageProperties
@@ -18,4 +18,27 @@ public static class MessageProperties
     public const string ContentType = "content-type";
     public const string Size = "size";
     public const string Sha256 = "sha256";
+
+    /// <summary>
+    /// Present only on a chunked attachment, and the value that tells a part of a file from
+    /// a whole one. It is carried by every chunk and by no whole file, so the test for it
+    /// *is* the classification — see <see cref="RequiredProperties.OptionalString"/>.
+    /// </summary>
+    public const string TransferId = "transfer-id";
+
+    /// <summary>Zero-based position of this chunk within the transfer.</summary>
+    public const string ChunkIndex = "chunk-index";
+
+    /// <summary>Total chunks in the transfer. Always 2 or more, since one chunk is not a chunking.</summary>
+    public const string ChunkCount = "chunk-count";
+
+    /// <summary>Byte count of the whole original file, checked once the parts are back together.</summary>
+    public const string FileSize = "file-size";
+
+    /// <summary>
+    /// SHA-256 of the whole original file. <see cref="Sha256"/> covers this message's bytes
+    /// and so verifies each chunk as it lands; this one verifies the file after the merge,
+    /// which is the only place a wrong or missing part can be caught.
+    /// </summary>
+    public const string FileSha256 = "file-sha256";
 }

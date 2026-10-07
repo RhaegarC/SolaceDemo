@@ -6,6 +6,7 @@ using SolaceSystems.Solclient.Messaging.SDT;
 
 var options = DemoOptions.Load();
 var store = new AttachmentStore();
+var assembly = new ChunkAssembly(abandoned => Log(abandoned));
 
 Log($"host {options.Host}  vpn {options.VpnName}  user {options.UserName}");
 Log($"queue {options.QueueName}, subscribed to topic case/>");
@@ -136,7 +137,7 @@ var flowProperties = new FlowProperties
 };
 
 IFlow? flow = null;
-flow = session.CreateFlow(flowProperties, queue, null, (_, args) => OnMessage(flow!, args, options, store), OnFlowEvent);
+flow = session.CreateFlow(flowProperties, queue, null, (_, args) => OnMessage(flow!, args, options, store, assembly), OnFlowEvent);
 
 flow.Start();
 Log("waiting for attachments — press Enter to exit");
@@ -152,7 +153,7 @@ ContextFactory.Instance.Cleanup();
 Log("stopped");
 return 0;
 
-static void OnMessage(IFlow flow, MessageEventArgs args, DemoOptions options, AttachmentStore store)
+static void OnMessage(IFlow flow, MessageEventArgs args, DemoOptions options, AttachmentStore store, ChunkAssembly assembly)
 {
     var message = args.Message;
 
@@ -160,16 +161,41 @@ static void OnMessage(IFlow flow, MessageEventArgs args, DemoOptions options, At
     {
         var properties = message.UserPropertyMap;
 
-        var caseId = Require(properties, MessageProperties.CaseId);
-        var fileName = Require(properties, MessageProperties.FileName);
+        var caseId = RequiredProperties.String(properties, MessageProperties.CaseId);
+        var fileName = RequiredProperties.String(properties, MessageProperties.FileName);
         var payload = message.BinaryAttachment ?? [];
 
+        // This hash covers the bytes of this message, so it holds for a chunk exactly as it
+        // does for a whole file and is checked before either path is taken. It proves the
+        // chunk arrived intact; only the file hash after the merge can prove it was the
+        // right chunk.
         VerifyHash(properties, payload);
 
-        var path = LocalFileNames.ResolveUnder(options.OutputRoot, caseId, fileName);
-        store.Write(path, payload);
+        // A part of a file is told from a whole one by whether the transfer id is there at all.
+        // It is the property a chunked file must carry and a whole one cannot, so its presence
+        // is the classification and no separate flag is needed.
+        if (RequiredProperties.OptionalString(properties, MessageProperties.TransferId) is null)
+        {
+            var path = LocalFileNames.ResolveUnder(options.OutputRoot, caseId, fileName);
+            store.Write(path, payload);
 
-        Log($"[ok]       {caseId}  {fileName}  {FormatSize(payload.LongLength)} → {path}");
+            Log($"[ok]       {caseId}  {fileName}  {FormatSize(payload.LongLength)} → {path}");
+            return;
+        }
+
+        var progress = assembly.Add(properties, caseId, fileName, payload);
+        if (progress.Assembled is null)
+        {
+            Log($"[chunk]    {caseId}  {fileName}  {progress.Index + 1}/{progress.Count}");
+            return;
+        }
+
+        // Written only once the last chunk is in, so an incomplete transfer leaves nothing on
+        // disk rather than a truncated file that looks like a whole one.
+        var assembledPath = LocalFileNames.ResolveUnder(options.OutputRoot, caseId, fileName);
+        store.Write(assembledPath, progress.Assembled);
+
+        Log($"[ok]       {caseId}  {fileName}  {FormatSize(progress.Assembled.LongLength)} from {progress.Count} chunks → {assembledPath}");
     }
     catch (RejectedAttachmentException ex)
     {
@@ -201,25 +227,15 @@ static void OnMessage(IFlow flow, MessageEventArgs args, DemoOptions options, At
 
 static void VerifyHash(IMapContainer? properties, byte[] payload)
 {
-    var expected = properties?.GetString(MessageProperties.Sha256);
-    if (string.IsNullOrEmpty(expected)) return;
+    // Required, not optional: a message that carries no digest is one that cannot be
+    // checked, and slipping past the comparison is the opposite of what this is for.
+    var expected = RequiredProperties.String(properties, MessageProperties.Sha256);
 
     var actual = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
     if (!string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase))
     {
         throw new RejectedAttachmentException($"sha256 mismatch (expected {expected}, got {actual})");
     }
-}
-
-static string Require(IMapContainer? properties, string key)
-{
-    var value = properties?.GetString(key);
-    if (string.IsNullOrEmpty(value))
-    {
-        throw new RejectedAttachmentException($"missing property '{key}'");
-    }
-
-    return value;
 }
 
 static void OnSessionEvent(object? sender, SessionEventArgs args) =>

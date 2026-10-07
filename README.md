@@ -1,12 +1,15 @@
 # SolaceDemo — case attachments over Solace PubSub+
 
-A case has a unique ID and owns several attachments of different formats, each under 10 MB.
-`SolaceClient` (WPF) publishes them; `SolaceConsumer` (console) receives them and writes them to
-disk.
+A case has a unique ID and owns several attachments of different formats. `SolaceClient` (WPF)
+publishes them; `SolaceConsumer` (console) receives them and writes them to disk.
 
 The attachments travel **through** the broker as persistent messages — this is not a claim-check
 demo, and the files are not copied out of band. The broker spools them, so a consumer that is
 stopped while a case is published still receives every file when it comes back.
+
+A file that fits in one message is sent as one. A larger file is split over several messages, each
+carrying its position in the file, and the consumer writes the file only once the last part has
+arrived — so a file is no longer bounded by the broker's per-message limit.
 
 ```
 SolaceClient (WPF)                          SolaceConsumer (console)
@@ -35,18 +38,39 @@ SolaceClient (WPF)                          SolaceConsumer (console)
 ```
 topic      case/{caseId}/attachment/{format}/{sanitizedFileName}
 
-payload    the file's bytes, verbatim
+payload    the file's bytes, verbatim — or one chunk of them, when the file is split
 
 properties case-id       string   GUID
            filename      string   ORIGINAL name — authoritative for the disk path
            content-type  string   MIME type
            size          long     payload byte count
-           sha256        string   hex digest, verified by the consumer
+           sha256        string   hex digest of the payload, verified by the consumer
+
+           and, on a chunk of a split file only:
+
+           transfer-id   string   one id per file, shared by every chunk of it
+           chunk-index   int      0-based position of this payload
+           chunk-count   int      total chunks, always 2 or more
+           file-size     long     byte count of the whole original file
+           file-sha256   string   hex digest of the whole original file
 ```
 
 The filename appears twice on purpose. The **topic** carries a percent-encoded slug, because a topic
 is UTF-8 and capped at 250 bytes and the filename is user-controlled. The **property** carries the
 original, and it is the only value the consumer will use to name a file on disk.
+
+`size` and `sha256` describe the message, so they mean the same thing whether it carries a whole file
+or one chunk of one. `file-size` and `file-sha256` describe the file the chunks belong to, and are the
+only values that can be checked after the merge — the per-message hash proves a chunk arrived intact,
+not that it was the right chunk. Chunks share the topic and the naming properties, so any single
+message tells the consumer everything it needs to place it.
+
+A message with no `transfer-id` is a whole file. That is the marker rather than `chunk-count` because
+it is the property a chunked file must carry and a whole one cannot: its presence *is* the
+classification, so no separate flag has to be kept in step with it. Absence is not inferred from a
+default value — the SDK raises `FieldNotFoundException` for a key that was never set, and the reader
+turns that into "not a chunk". A key that is present but not a string is rejected rather than read as
+absent, so a malformed message cannot slip through as a whole file.
 
 ## Prerequisites
 
@@ -103,8 +127,11 @@ Received files land under `out/{caseId}/{filename}` relative to the consumer's w
    on disk. The log shows the topic each file was published to.
 2. **The spool.** Stop the consumer, publish another case, restart the consumer. Every file still
    arrives, because the queue held them while nothing was bound to it.
-3. **The cap.** Add a file of 11 MB. It is marked `REFUSED` in the list and nothing is published
-   for it; the rest of the case publishes normally.
+3. **Chunking.** Add a file larger than 5 MB. The list shows how many chunks it will be sent as, the
+   log shows one `[chunk] n/N` line per part, and the consumer reports a single `[ok]` line once the
+   file is complete. The file on disk matches the original byte for byte.
+4. **The ceiling.** Add a file at or over 200 MB. It is marked `REFUSED` in the list and nothing is
+   published for it; the rest of the case publishes normally.
 
 ## Client certificate authentication
 
@@ -163,13 +190,25 @@ that native layer and a non-exportable key fails with
 **Raw binary, not base64.** A JSON envelope would inflate the payload ~33%, cutting the usable file
 ceiling from 10 MB to about 7.5 MB. Raw bytes keep the full budget.
 
-**The cap defaults to 9,500,000 bytes, not 10,000,000.** The broker's limit applies to the whole
-message, so a file *at* 10 MB plus its properties and headers would be refused by the broker after
-passing client-side validation. The client asks the broker for its real ceiling at connect
-(`MAX_GUARANTEED_MSG_SIZE`) and shows it beside the configured cap, so the two can be compared if
-the cap is changed. That number is not in the message-VPN's SEMP config, so `provision.sh` can only
-report it where a broker exposes a `maxMsgSize` field — on the broker used here it does not, and the
-script says so rather than inventing a figure.
+**The per-message cap defaults to 9,500,000 bytes, not 10,000,000.** The broker's limit applies to
+the whole message, so a payload *at* 10 MB plus its properties and headers would be refused by the
+broker after passing client-side validation. Since chunking, nothing a user selects meets this cap
+any more — it survives as the bound a chunk size is clamped to, so a misconfigured chunk size cannot
+produce a message the broker will reject. The client asks the broker for its real ceiling at connect
+(`MAX_GUARANTEED_MSG_SIZE`) and shows it, so the two can be compared. That number is not in the
+message-VPN's SEMP config, so `provision.sh` can only report it where a broker exposes a `maxMsgSize`
+field — on the broker used here it does not, and the script says so rather than inventing a figure.
+
+**Split above 5 MB, and merged before writing.** `Demo:ChunkSizeBytes` is both the size at which a
+file starts being split and the size of each piece — one number, because a chunk larger than the
+split point contradicts itself. Chunks carry a shared `transfer-id` and an index, so they reassemble
+in order no matter how they interleave with other files in flight. The consumer writes nothing until
+the last chunk is in, so an interrupted transfer leaves no file on disk rather than one that is
+silently short.
+
+A whole file is still read into memory at both ends, which is why `Demo:MaxFileBytes` exists at all:
+chunking lifts the per-message ceiling off a file but not the need for some ceiling. A file over it
+is refused with its size and the limit, which is the job the per-message cap used to do.
 
 **Guaranteed delivery, so every message is settled.** The consumer acks every message, including the
 ones it rejects. On a durable queue an unsettled message is redelivered forever, so a single
@@ -195,4 +234,8 @@ The case ID is sanitized too — it is a message property and is not trusted eit
   demo volume; a real consumer would hand off to a worker.
 - The publisher does not retry a failed send; the file is marked `failed` in the list and the rest of
   the case continues.
+- A chunked transfer that never completes is held in memory until the consumer is restarted, or until
+  enough other transfers arrive to displace it: at most 32 part-built transfers and 256 MB in total,
+  oldest abandoned first, with the abandoned one named in the log. Nothing retries a missing chunk,
+  because every message is acked on arrival and never redelivered.
 - No dead message queue, no per-format routing, no case-completeness event.

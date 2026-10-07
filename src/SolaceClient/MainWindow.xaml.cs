@@ -44,7 +44,7 @@ public partial class MainWindow : Window
                 : string.Empty;
             var validationNote = _options.ValidateServerCertificate ? string.Empty : ", broker NOT authenticated";
 
-            UpdateStatus($"Connected. Cap {_options.MaxAttachmentBytes:N0} bytes{brokerNote}{identityNote}{validationNote}.");
+            UpdateStatus($"Connected. Chunking above {_options.ChunkSizeBytes:N0} bytes, files to {_options.MaxFileBytes:N0}{brokerNote}{identityNote}{validationNote}.");
 
             if (_publisher.ClientCertificateSubject is { } identity)
             {
@@ -88,12 +88,14 @@ public partial class MainWindow : Window
 
         foreach (var path in dialog.FileNames)
         {
-            var item = new AttachmentItem(path, _options.MaxAttachmentBytes);
+            var item = new AttachmentItem(path, _options.MaxFileBytes, _options.ChunkSizeBytes);
             Attachments.Add(item);
 
             Log(item.IsRefused
                 ? $"refused  {item.FileName} — {item.RefusalReason}"
-                : $"staged   {item.FileName} ({item.SizeText})");
+                : item.IsChunked
+                    ? $"staged   {item.FileName} ({item.SizeText}) — {item.ChunkCount:N0} chunks"
+                    : $"staged   {item.FileName} ({item.SizeText})");
         }
     }
 
@@ -122,12 +124,13 @@ public partial class MainWindow : Window
         Log($"publishing {staged.Count} attachment(s) for case {_caseId}");
 
         var published = 0;
+        var messages = 0;
         foreach (var item in staged)
         {
             // Re-measure here as well: the file may have grown since it was staged, and
-            // the cap has to hold at the moment of sending, not only at selection.
+            // the ceiling has to hold at the moment of sending, not only at selection.
             var currentSize = new FileInfo(item.FullPath).Length;
-            if (currentSize >= _options.MaxAttachmentBytes)
+            if (currentSize >= _options.MaxFileBytes)
             {
                 item.Status = "REFUSED at publish";
                 Log($"refused  {item.FileName} — grew to {currentSize:N0} bytes");
@@ -141,20 +144,27 @@ public partial class MainWindow : Window
                 var payload = await File.ReadAllBytesAsync(item.FullPath);
                 var contentType = ContentTypes.For(item.FileName);
 
-                await Task.Run(() => _publisher.Publish(topic, _caseId, item.FileName, contentType, payload));
+                var sent = await Task.Run(() => _publisher.PublishAttachment(
+                    topic, _caseId, item.FileName, contentType, payload, _options.ChunkSizeBytes));
 
-                item.Status = "published";
+                item.Status = sent > 1 ? $"published ({sent:N0} chunks)" : "published";
                 published++;
-                Log($"published {topic}");
+                messages += sent;
+
+                Log(sent > 1
+                    ? $"published {item.FileName} ({item.SizeText}) as {sent:N0} chunks"
+                    : $"published {topic}");
             }
             catch (Exception ex)
             {
+                // A file part-way through its chunks leaves the consumer holding an
+                // incomplete transfer; it is abandoned there rather than written.
                 item.Status = "failed";
                 Log($"failed    {item.FileName} — {ex.Message}");
             }
         }
 
-        Log($"done: {published}/{staged.Count} published");
+        Log($"done: {published}/{staged.Count} published, {messages} message(s)");
         SetBusy(false);
     }
 
