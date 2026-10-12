@@ -11,6 +11,10 @@ A file that fits in one message is sent as one. A larger file is split over seve
 carrying its position in the file, and the consumer writes the file only once the last part has
 arrived — so a file is no longer bounded by the broker's per-message limit.
 
+`SolaceClient` has a second tab, **JSON message**, which sends a JSON document to a fixed test topic
+over the same session — a plain payload with no file behind it. Its topic has a durable queue of its
+own, so a message sent while nothing is listening is still there when a consumer binds.
+
 ```
 SolaceClient (WPF)                          SolaceConsumer (console)
   pick files, publish                         write to out/{caseId}/{fileName}
@@ -29,7 +33,7 @@ SolaceClient (WPF)                          SolaceConsumer (console)
 |---|---|
 | [src/SolaceClient/](src/SolaceClient/) | WPF publisher — generates a case ID, picks files, publishes |
 | [src/SolaceConsumer/](src/SolaceConsumer/) | Console consumer — binds the queue, writes attachments |
-| [provision.sh](provision.sh) | Creates the queue, subscription, ACL profile and client user |
+| [provision.sh](provision.sh) | Creates the queues, subscriptions, ACL profile and client user |
 | [demo-up.sh](demo-up.sh) | Waits for the broker, then runs `provision.sh` |
 | [docs/note.md](docs/note.md) | The broker container command |
 
@@ -92,6 +96,11 @@ docker run -d -p 8080:8080 -p 55555:55555 --shm-size=1g \
 
 A first boot takes a minute or two before SEMP answers.
 
+Provisioning creates one durable queue per destination: the attachment queue on `case/>`, and a second
+on the JSON tab's topic. There is no topic object to create — a Solace topic is an address, not an
+object, and it exists as soon as something subscribes to or publishes on it. What has to be created is
+the *subscription*, so the address is matched by something.
+
 ## Run it
 
 ```bash
@@ -121,6 +130,11 @@ dotnet run --project src/SolaceClient       # or F5 in Visual Studio
 In the client: it shows a generated case ID → **Add files…** → select several files → **Publish case**.
 Received files land under `out/{caseId}/{filename}` relative to the consumer's working directory.
 
+On the **JSON message** tab, the topic comes from `Demo:TestTopic` in `appsettings.json` and is shown
+read-only — one fixed destination rather than a second place the destination is written down. The body
+is prefilled with a sample object; edit it and press **Send JSON**. The body is parsed before it is
+sent, so a malformed document is refused in the log and nothing reaches the broker.
+
 ### What to demonstrate
 
 1. **The pipeline.** Publish a case; the consumer logs one `[ok]` line per file and the files appear
@@ -132,6 +146,11 @@ Received files land under `out/{caseId}/{filename}` relative to the consumer's w
    file is complete. The file on disk matches the original byte for byte.
 4. **The ceiling.** Add a file at or over 200 MB. It is marked `REFUSED` in the list and nothing is
    published for it; the rest of the case publishes normally.
+5. **The JSON tab.** Press **Send JSON** with the sample body and the log shows the topic and the byte
+   count. Nothing in this repo consumes that queue, so read the message back with any client bound to
+   `test/integration/dataTran/sysname/cc/json/q`. Leaving a gap between the send and the read is the
+   point: the queue held it. Then send a body with a missing brace — the log refuses it and the queue
+   stays empty.
 
 ## Client certificate authentication
 
@@ -215,6 +234,19 @@ ones it rejects. On a durable queue an unsettled message is redelivered forever,
 unacceptable message would stall everything behind it. A rejection is logged and acked; a transient
 write failure is retried three times, then logged and acked.
 
+**The JSON message is Persistent, on a queue of its own.** Persistent is what makes the queue worth
+having: under Direct delivery a durable queue retains nothing, so the queue created for this tab would
+have been decorative. It costs the broker a spool write per message, which is the price of "sent while
+nothing was bound, read later" being true rather than asserted. The queue is separate from the
+attachment queue so that a JSON message cannot sit in front of a file, and so the two can be
+permissioned apart later without touching the other.
+
+**The JSON message carries no attachment properties.** It sends `content-type` and nothing else.
+`case-id`, `filename`, `size` and `sha256` describe a file; a JSON document has none behind it, and a
+message carrying them would state something false about itself. What the two paths share is the code
+that builds a message and the code that turns a failed send into an exception — the payload and the
+properties are per path.
+
 **Two projects, no test project.** By decision. The sanitizers are pure static methods
 (`AttachmentTopics`, `LocalFileNames`) so they stay checkable by hand, but nothing asserts them
 automatically — see the verification list below for what was actually run and observed.
@@ -238,4 +270,7 @@ The case ID is sanitized too — it is a message property and is not trusted eit
   enough other transfers arrive to displace it: at most 32 part-built transfers and 256 MB in total,
   oldest abandoned first, with the abandoned one named in the log. Nothing retries a missing chunk,
   because every message is acked on arrival and never redelivered.
+- Nothing in this repo consumes the JSON queue. It is read by hand, through the broker's own tools or
+  any client bound to `test/integration/dataTran/sysname`. The tab demonstrates that a message is
+  delivered and held, not a round trip.
 - No dead message queue, no per-format routing, no case-completeness event.

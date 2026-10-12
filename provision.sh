@@ -6,12 +6,21 @@
 #                                   durable, so it spools while the consumer is down
 #   topic    case/>                 subscribed to that queue, which is how the
 #                                   publisher reaches it without knowing it exists
+#   queue    test/integration/dataTran/sysname/cc/json/q
+#                                   durable, for the JSON message tab
+#   topic    test/integration/dataTran/sysname
+#                                   subscribed to that queue, so a JSON message
+#                                   survives being sent with nothing bound
 #   acl      case-attach            publish to case/>, consume that queue, and
 #                                   nothing else
 #   user     appuser                a limited client user carrying that ACL
 #
-# The apps connect as appuser, never as admin: provisioning is an operator action, not
-# something the demo runs at startup.
+# The appuser entry above is the least-privilege shape to deploy against; the demo's own
+# apps do not use it. appsettings.json connects as test-client, which the broker resolves
+# to its built-in "default" ACL profile, and that profile already permits publishing to
+# the JSON test topic — so no exception is added for it here.
+#
+# Provisioning is an operator action, not something the demo runs at startup.
 #
 # Works against any broker — local or a remote Linux host — and is idempotent, so
 # re-running it is safe.
@@ -33,6 +42,11 @@ ADMIN_PASSWORD="${SOLACE_ADMIN_PASSWORD:-QAZwsx.123456}"
 QUEUE="${SOLACE_QUEUE:-test/integration/dataTran/sysname/cc/case/attach/q}"
 TOPIC_PREFIX="${SOLACE_TOPIC_PREFIX:-case}"
 SUBSCRIPTION="${SOLACE_SUBSCRIPTION:-${TOPIC_PREFIX}/>}"
+
+# The JSON message tab's destination, and the queue that listens on it. The queue name
+# follows the attachment queue's shape: the topic it binds, then the kind, then "q".
+JSON_TOPIC="${SOLACE_JSON_TOPIC:-test/integration/dataTran/sysname}"
+JSON_QUEUE="${SOLACE_JSON_QUEUE:-${JSON_TOPIC}/cc/json/q}"
 ACL_PROFILE="${SOLACE_ACL_PROFILE:-case-attach}"
 APP_USER="${SOLACE_APP_USER:-appuser}"
 APP_PASSWORD="${SOLACE_APP_PASSWORD:-apppass}"
@@ -59,6 +73,8 @@ urlencode() {
 
 QUEUE_PATH="$(urlencode "$QUEUE")"
 SUBSCRIPTION_PATH="$(urlencode "$SUBSCRIPTION")"
+JSON_QUEUE_PATH="$(urlencode "$JSON_QUEUE")"
+JSON_TOPIC_PATH="$(urlencode "$JSON_TOPIC")"
 
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
@@ -161,6 +177,20 @@ ensure "/msgVpns/${VPN}/queues/${QUEUE_PATH}/subscriptions" \
     "topic ${SUBSCRIPTION}" \
     "/msgVpns/${VPN}/queues/${QUEUE_PATH}/subscriptions/${SUBSCRIPTION_PATH}"
 
+# The JSON tab's destination. A topic is not an object on a Solace broker and cannot be
+# created: it is an address that exists once something subscribes to or publishes on it.
+# The queue and the subscription below are what make it real, and binding a durable queue
+# to it is what keeps a message sent while no one is listening.
+ensure "/msgVpns/${VPN}/queues" \
+    "$(printf '{"queueName":"%s","permission":"consume","ingressEnabled":true,"egressEnabled":true}' "$JSON_QUEUE")" \
+    "queue ${JSON_QUEUE}" \
+    "/msgVpns/${VPN}/queues/${JSON_QUEUE_PATH}"
+
+ensure "/msgVpns/${VPN}/queues/${JSON_QUEUE_PATH}/subscriptions" \
+    "$(printf '{"subscriptionTopic":"%s"}' "$JSON_TOPIC")" \
+    "topic ${JSON_TOPIC}" \
+    "/msgVpns/${VPN}/queues/${JSON_QUEUE_PATH}/subscriptions/${JSON_TOPIC_PATH}"
+
 printf '\nVerifying\n'
 verify() {
     local path="$1" needle="$2" label="$3" code
@@ -176,6 +206,8 @@ verify() {
 
 verify "/msgVpns/${VPN}/queues/${QUEUE_PATH}" "$QUEUE" "queue exists"
 verify "/msgVpns/${VPN}/queues/${QUEUE_PATH}/subscriptions" "$SUBSCRIPTION" "subscription exists"
+verify "/msgVpns/${VPN}/queues/${JSON_QUEUE_PATH}" "$JSON_QUEUE" "json queue exists"
+verify "/msgVpns/${VPN}/queues/${JSON_QUEUE_PATH}/subscriptions" "$JSON_TOPIC" "json subscription exists"
 verify "/msgVpns/${VPN}/clientUsernames/${APP_USER}" "$APP_USER" "client user exists"
 
 # The broker's own ceiling. The publisher's configured cap has to stay under this,
