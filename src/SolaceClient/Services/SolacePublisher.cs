@@ -1,6 +1,8 @@
 using System.IO;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.Json;
 using SolaceSystems.Solclient.Messaging;
 
 namespace SolaceClient.Services;
@@ -204,6 +206,70 @@ public sealed class SolacePublisher : IDisposable
 
         properties.Close();
 
+        Dispatch(session, message, topic);
+    }
+
+    /// <summary>
+    /// Publishes one JSON message to <paramref name="topic"/>: the document's UTF-8 bytes are
+    /// the payload and its content type is the only property. A JSON ping is not an
+    /// attachment, so it carries none of the case-id/filename/size/sha256 properties that
+    /// describe a file — those would state things about a message that has no file behind it.
+    /// Returns the payload's byte count.
+    ///
+    /// The body is validated here rather than in the click handler, so it holds for every
+    /// caller: a malformed document, or one that is valid JSON but not an object, is refused
+    /// before anything is sent. Nothing reaches the broker on the throwing paths.
+    /// </summary>
+    public int PublishJson(string topic, string json)
+    {
+        // Measured in bytes, not characters: Length undercounts anything outside the basic
+        // plane, and the ceiling applies to what goes on the wire. Compared against the
+        // configured attachment cap rather than BrokerMaxGuaranteedMessageBytes, which reads
+        // 0 when the capability cannot be queried — 0 there means "unknown", not "nothing
+        // may be sent", so it must not become the ceiling.
+        var payload = Encoding.UTF8.GetBytes(json);
+        if (payload.LongLength > _options.MaxAttachmentBytes)
+        {
+            throw new ArgumentException(
+                $"JSON payload is {payload.LongLength:N0} bytes, over the {_options.MaxAttachmentBytes:N0}-byte message limit.");
+        }
+
+        // Parsed to prove it is JSON, then dropped: the message carries the text as typed
+        // rather than a re-serialised copy, so what the consumer reads is what was written.
+        using (var document = JsonDocument.Parse(json))
+        {
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new ArgumentException(
+                    $"The payload is a JSON {document.RootElement.ValueKind}, not an object.");
+            }
+        }
+
+        var session = _session ?? throw new InvalidOperationException("Not connected.");
+
+        using var message = session.CreateMessage();
+        message.Destination = ContextFactory.Instance.CreateTopic(topic);
+        message.DeliveryMode = MessageDeliveryMode.Persistent;
+        message.BinaryAttachment = payload;
+        message.HttpContentType = ContentTypes.Json;
+
+        // Closed before the send; an open map is a native memory leak that only shows up
+        // under volume.
+        var properties = message.CreateUserPropertyMap();
+        properties.AddString(MessageProperties.ContentType, ContentTypes.Json);
+        properties.Close();
+
+        Dispatch(session, message, topic);
+        return payload.Length;
+    }
+
+    /// <summary>
+    /// Sends a message that has already been built, turning a non-OK return code into an
+    /// exception. Shared by the attachment and JSON paths so that what counts as a failed
+    /// send is decided in one place rather than in each caller.
+    /// </summary>
+    private static void Dispatch(ISession session, IMessage message, string topic)
+    {
         var result = session.Send(message);
         if (result != ReturnCode.SOLCLIENT_OK)
         {

@@ -11,6 +11,12 @@ public static class ContentTypes
 {
     public const string Fallback = "application/octet-stream";
 
+    /// <summary>
+    /// The type a JSON message carries, named here rather than written out at the one call
+    /// site, so the JSON tab and a ".json" attachment cannot disagree about it.
+    /// </summary>
+    public const string Json = "application/json";
+
     private static readonly Dictionary<string, string> ByExtension = new(StringComparer.OrdinalIgnoreCase)
     {
         [".pdf"] = "application/pdf",
@@ -26,7 +32,7 @@ public static class ContentTypes
         [".txt"] = "text/plain",
         [".csv"] = "text/csv",
         [".xml"] = "application/xml",
-        [".json"] = "application/json",
+        [".json"] = Json,
         [".html"] = "text/html",
         [".doc"] = "application/msword",
         [".docx"] = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",

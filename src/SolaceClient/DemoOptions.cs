@@ -20,6 +20,13 @@ public sealed class DemoOptions
     private const string DefaultTopicPrefix = "case";
 
     /// <summary>
+    /// Where the JSON message tab sends. Not derived from <see cref="TopicPrefix"/>: the
+    /// attachment topics are built from that prefix plus a case id, whereas this is one
+    /// fixed destination the tab exists to hit.
+    /// </summary>
+    private const string DefaultTestTopic = "test/integration/dataTran/sysname";
+
+    /// <summary>
     /// Sits below the broker's guaranteed ceiling rather than exactly on it: the limit
     /// applies to the whole message, and a file at the limit plus its properties and
     /// headers would be refused by the broker after passing our own check.
@@ -45,6 +52,9 @@ public sealed class DemoOptions
     public string UserName { get; init; } = DefaultUserName;
     public string Password { get; init; } = DefaultPassword;
     public string TopicPrefix { get; init; } = DefaultTopicPrefix;
+
+    /// <summary>The topic the JSON message tab publishes to.</summary>
+    public string TestTopic { get; init; } = DefaultTestTopic;
 
     /// <summary>The ceiling on one message. Chunking keeps every chunk under it.</summary>
     public long MaxAttachmentBytes { get; init; } = DefaultMaxAttachmentBytes;
@@ -111,6 +121,7 @@ public sealed class DemoOptions
             UserName = config["Solace:UserName"] ?? DefaultUserName,
             Password = config["Solace:Password"] ?? DefaultPassword,
             TopicPrefix = config["Demo:TopicPrefix"] ?? DefaultTopicPrefix,
+            TestTopic = ReadString(config["Demo:TestTopic"], DefaultTestTopic),
             MaxAttachmentBytes = maxAttachmentBytes,
             ChunkSizeBytes = chunkSizeBytes,
             MaxFileBytes = ReadPositive(config["Demo:MaxFileBytes"], DefaultMaxFileBytes),
@@ -138,6 +149,14 @@ public sealed class DemoOptions
     /// </summary>
     private static long ReadPositive(string? value, long fallback) =>
         long.TryParse(value, out var parsed) && parsed > 0 ? parsed : fallback;
+
+    /// <summary>
+    /// Reads a text setting, falling back when it is absent or blank. Blank counts as absent
+    /// because an empty key in a configuration file is a value that was cleared rather than
+    /// one that was chosen.
+    /// </summary>
+    private static string ReadString(string? value, string fallback) =>
+        string.IsNullOrWhiteSpace(value) ? fallback : value;
 
     /// <summary>
     /// Resolves a configured file name against the application directory, which is where
